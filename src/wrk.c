@@ -29,11 +29,7 @@
 #include "tinymt64.h"
 #include "urls.h"
 
-#ifdef BSD
-#define LOCAL_ADDRSTRLEN (sizeof(struct sockaddr_un) - sizeof(((struct sockaddr_un *)0)->sun_len) - sizeof(((struct sockaddr_un *)0)->sun_family))
-#elif __linux
 #define LOCAL_ADDRSTRLEN sizeof(((struct sockaddr_un *)0)->sun_path)
-#endif
 
 static struct config {
     struct addrinfo addr;
@@ -84,6 +80,13 @@ int main(int argc, char **argv) {
     struct sigaction sigint_action;
     char *url, **headers;
     int rc;
+
+    /*
+     * To avoid dying on SIGPIPE when the remote [local] host suddely dies,
+     * we should ignore SIGPIPE. This is handy when working against unstable
+     * servers which may abruptly terminate on assertions, segfaults, etc.
+     */
+    signal(SIGPIPE, SIG_IGN);
 
     /* +1 for possible Connection: keep-alive */
     headers = zmalloc((argc + 1) * sizeof(char *));
@@ -264,7 +267,7 @@ int main(int argc, char **argv) {
         thread *t = &threads[i];
 
 #ifdef __linux
-        await_thread(t->thread, threads);
+        await_thread_with_progress_report(t->thread, threads);
 #else
         pthread_join(t->thread, NULL);
 #endif
@@ -633,6 +636,29 @@ static void print_stats(char *name, stats *stats, char *(*fmt)(long double)) {
     printf("%8.2Lf%%\n", stats_within_stdev(stats, mean, stdev, 1));
 }
 
+#if defined(__linux__)
+
+/* Will call progress_report every 5 seconds until the thread is finished */
+static int await_thread_with_progress_report(pthread_t t, thread *threads) {
+    int s;
+
+    while (1) {
+        struct timespec ts;
+        struct timeval tv;
+
+        gettimeofday(&tv, 0);
+        ts.tv_sec = tv.tv_sec + 5;
+        ts.tv_usec = tv.tv_nsec * 1000;
+        
+        s = pthread_timedjoin_np(t, NULL, &ts);
+        if (s == ETIMEDOUT) {
+            progress_report(threads);
+        } else {
+            return s;
+        }
+    }
+}
+
 static void progress_report(thread *threads){
     uint64_t complete=0;
 
@@ -642,20 +668,5 @@ static void progress_report(thread *threads){
     printf("Completed %"PRIu64" requests\n", complete);
 }
 
-/* Will call progress_report every 5 seconds until the thread is finished */
-static int await_thread(pthread_t t, thread *threads) {
-    struct timespec ts;
-    int s;
+#endif /* __linux__ */
 
-    while (1) {
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += 5;
-
-        s = pthread_timedjoin_np(t, NULL, &ts);
-        if (s == ETIMEDOUT) {
-            progress_report(threads);
-        } else {
-            return s;
-        }
-    }
-}
