@@ -29,11 +29,7 @@
 #include "tinymt64.h"
 #include "urls.h"
 
-#ifdef BSD
-#define LOCAL_ADDRSTRLEN (sizeof(struct sockaddr_un) - sizeof(((struct sockaddr_un *)0)->sun_len) - sizeof(((struct sockaddr_un *)0)->sun_family))
-#elif __linux
 #define LOCAL_ADDRSTRLEN sizeof(((struct sockaddr_un *)0)->sun_path)
-#endif
 
 static struct config {
     struct addrinfo addr;
@@ -72,7 +68,7 @@ static void usage() {
            "    -p, --paths       <s>  File containing path-only urls\n"
            "    -s, --socket      <s>  Connect to a local socket     \n"
            "                                                         \n"
-           "    -H, --header      <s>  Add header to request         \n"
+           "    -H, --header      <s>  Add HTTP header to request    \n"
            "    -v, --version          Print version details         \n"
            "                                                         \n"
            "  Numeric arguments may include a SI unit (2k, 2M, 2G)   \n");
@@ -85,8 +81,15 @@ int main(int argc, char **argv) {
     char *url, **headers;
     int rc;
 
-    /* +1 for possible Connection: keep-alive */
-    headers = zmalloc((argc + 1) * sizeof(char *));
+    /*
+     * To avoid dying on SIGPIPE when the remote [local] host suddely dies,
+     * we should ignore SIGPIPE. This is handy when working against unstable
+     * servers which may abruptly terminate on assertions, segfaults, etc.
+     */
+    signal(SIGPIPE, SIG_IGN);
+
+    /* Number of '-H' headers specified. */
+    headers = zmalloc(argc * sizeof(char *));
 
     if (parse_args(&cfg, &url, headers, argc, argv)) {
         usage();
@@ -264,7 +267,7 @@ int main(int argc, char **argv) {
         thread *t = &threads[i];
 
 #ifdef __linux
-        await_thread(t->thread, threads);
+        await_thread_with_progress_report(t->thread, threads);
 #else
         pthread_join(t->thread, NULL);
 #endif
@@ -416,23 +419,22 @@ static int request_complete(http_parser *parser) {
     }
 
     if (++thread->complete >= thread->requests) {
+        /* Completed the necessary number of requests; do not send more. */
         aeStop(thread->loop);
-        goto done;
+    } else {
+        c->latency = time_us() - c->start;
+
+        /* Reconnect or reuse the socket if keepalive is allowed. */
+        if (cfg.use_keepalive && http_should_keep_alive(parser)) {
+            http_parser_init(parser, HTTP_RESPONSE);
+            aeDeleteFileEvent(thread->loop, c->fd, AE_READABLE);
+            aeCreateFileEvent(thread->loop, c->fd, AE_WRITABLE,
+                socket_writeable, c);
+        } else {
+            reconnect_socket(thread, c);
+        }
     }
 
-    c->latency = time_us() - c->start;
-    if (!(cfg.use_keepalive && http_should_keep_alive(parser))) goto reconnect;
-
-    http_parser_init(parser, HTTP_RESPONSE);
-    aeDeleteFileEvent(thread->loop, c->fd, AE_READABLE);
-    aeCreateFileEvent(thread->loop, c->fd, AE_WRITABLE, socket_writeable, c);
-
-    goto done;
-
-  reconnect:
-    reconnect_socket(thread, c);
-
-  done:
     return 0;
 }
 
@@ -553,7 +555,6 @@ static int parse_args(struct config *cfg, char **url, char **headers, int argc, 
                 break;
             case 'k':
                 cfg->use_keepalive = 1;
-                *header++ = "Connection: keep-alive";
                 break;
             case 'H':
                 *header++ = optarg;
@@ -633,6 +634,29 @@ static void print_stats(char *name, stats *stats, char *(*fmt)(long double)) {
     printf("%8.2Lf%%\n", stats_within_stdev(stats, mean, stdev, 1));
 }
 
+#if defined(__linux__)
+
+/* Will call progress_report every 5 seconds until the thread is finished */
+static int await_thread_with_progress_report(pthread_t t, thread *threads) {
+    int s;
+
+    while (1) {
+        struct timespec ts;
+        struct timeval tv;
+
+        gettimeofday(&tv, 0);
+        ts.tv_sec = tv.tv_sec + 5;
+        ts.tv_usec = tv.tv_nsec * 1000;
+        
+        s = pthread_timedjoin_np(t, NULL, &ts);
+        if (s == ETIMEDOUT) {
+            progress_report(threads);
+        } else {
+            return s;
+        }
+    }
+}
+
 static void progress_report(thread *threads){
     uint64_t complete=0;
 
@@ -642,20 +666,5 @@ static void progress_report(thread *threads){
     printf("Completed %"PRIu64" requests\n", complete);
 }
 
-/* Will call progress_report every 5 seconds until the thread is finished */
-static int await_thread(pthread_t t, thread *threads) {
-    struct timespec ts;
-    int s;
+#endif /* __linux__ */
 
-    while (1) {
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += 5;
-
-        s = pthread_timedjoin_np(t, NULL, &ts);
-        if (s == ETIMEDOUT) {
-            progress_report(threads);
-        } else {
-            return s;
-        }
-    }
-}
